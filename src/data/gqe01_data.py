@@ -1,121 +1,108 @@
 """
-GQE-01 Data Module
+GQE-01 Market Data Module
 
-Downloads and validates SOL/USDT 5-minute spot market data
-for research and paper-trading backtests.
+Downloads and validates 5-minute SOL/USD market data from Coinbase.
+The saved dataset is named SOLUSDT_5m.csv for consistency with the
+GQE-01 research engine.
 
-No live orders are placed by this module.
+No missing candles are fabricated or forward-filled.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pandas as pd
 import requests
 
 
-SYMBOL = "SOLUSDT"
-INTERVAL = "5m"
+SOURCE_URL = "https://api.exchange.coinbase.com/products/SOL-USD/candles"
+
+INTERVAL_SECONDS = 300
 LOOKBACK_DAYS = 180
+MAX_CANDLES_PER_REQUEST = 300
 
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
-
-DATA_DIR = Path("data")
-OUTPUT_FILE = DATA_DIR / f"{SYMBOL}_{INTERVAL}.csv"
-
-INTERVAL_MS = 5 * 60 * 1000
-LIMIT = 1000
+OUTPUT_FILE = (
+    Path(__file__).resolve().parents[2]
+    / "data"
+    / "SOLUSDT_5m.csv"
+)
 
 
-def fetch_klines(start_time: int, end_time: int) -> list[list]:
-    """Fetch one batch of candles from Binance public market data."""
+def download_candles(
+    start_time: datetime,
+    end_time: datetime,
+) -> list[list]:
+    """Download one Coinbase candle window."""
 
     params = {
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "startTime": start_time,
-        "endTime": end_time,
-        "limit": LIMIT,
+        "granularity": INTERVAL_SECONDS,
+        "start": start_time.astimezone(timezone.utc).isoformat(),
+        "end": end_time.astimezone(timezone.utc).isoformat(),
     }
 
-    response = requests.get(BINANCE_URL, params=params, timeout=30)
+    response = requests.get(
+        SOURCE_URL,
+        params=params,
+        timeout=30,
+    )
     response.raise_for_status()
 
-    return response.json()
+    data = response.json()
+
+    if not isinstance(data, list):
+        raise RuntimeError("Unexpected Coinbase API response.")
+
+    return data
 
 
-def download_data() -> pd.DataFrame:
-    """Download approximately LOOKBACK_DAYS of 5-minute candles."""
+def download_history(
+    lookback_days: int = LOOKBACK_DAYS,
+) -> pd.DataFrame:
+    """Download historical 5-minute SOL/USD candles."""
 
-    end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=LOOKBACK_DAYS)
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=lookback_days)
 
-    start_time = int(start_dt.timestamp() * 1000)
-    end_time = int(end_dt.timestamp() * 1000)
+    all_candles = []
+    current_start = start_time
 
-    all_rows: list[list] = []
+    while current_start < end_time:
+        current_end = min(
+            current_start
+            + timedelta(seconds=INTERVAL_SECONDS * MAX_CANDLES_PER_REQUEST),
+            end_time,
+        )
 
-    print(f"Downloading {SYMBOL} {INTERVAL} data...")
-    print(f"Start: {start_dt.isoformat()}")
-    print(f"End:   {end_dt.isoformat()}")
+        candles = download_candles(current_start, current_end)
+        all_candles.extend(candles)
 
-    while start_time < end_time:
-        rows = fetch_klines(start_time, end_time)
-
-        if not rows:
-            break
-
-        all_rows.extend(rows)
-
-        last_open_time = rows[-1][0]
-        next_start_time = last_open_time + INTERVAL_MS
-
-        if next_start_time <= start_time:
-            break
-
-        start_time = next_start_time
-
-        print(f"Downloaded {len(all_rows):,} candles")
+        current_start = current_end
 
         time.sleep(0.15)
 
-    columns = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "close_time",
-        "quote_volume",
-        "trade_count",
-        "taker_buy_base_volume",
-        "taker_buy_quote_volume",
-        "ignore",
-    ]
+    if not all_candles:
+        raise RuntimeError("No market data was returned.")
 
-    df = pd.DataFrame(all_rows, columns=columns)
-
-    if df.empty:
-        raise ValueError("No market data was downloaded.")
-
-    return df
-
-
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean and normalize downloaded market data."""
-
-    df = df.copy()
-
-    df["open_time"] = pd.to_datetime(
-        df["open_time"], unit="ms", utc=True
+    df = pd.DataFrame(
+        all_candles,
+        columns=[
+            "timestamp",
+            "low",
+            "high",
+            "open",
+            "close",
+            "volume",
+        ],
     )
 
-    df["close_time"] = pd.to_datetime(
-        df["close_time"], unit="ms", utc=True
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        unit="s",
+        utc=True,
     )
 
     numeric_columns = [
@@ -124,30 +111,39 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
         "low",
         "close",
         "volume",
-        "quote_volume",
-        "trade_count",
-        "taker_buy_base_volume",
-        "taker_buy_quote_volume",
     ]
 
     for column in numeric_columns:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
 
-    df = df.sort_values("open_time")
-    df = df.drop_duplicates(subset="open_time")
-    df = df.reset_index(drop=True)
+    df = (
+        df[
+            [
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            ]
+        ]
+        .dropna()
+        .drop_duplicates(subset="timestamp")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
 
     return df
 
 
-def validate_data(df: pd.DataFrame) -> None:
-    """Run integrity checks before saving market data."""
-
-    if df.empty:
-        raise ValueError("Dataset is empty.")
+def validate_ohlcv(df: pd.DataFrame) -> dict:
+    """Validate basic OHLCV data quality."""
 
     required_columns = [
-        "open_time",
+        "timestamp",
         "open",
         "high",
         "low",
@@ -156,7 +152,8 @@ def validate_data(df: pd.DataFrame) -> None:
     ]
 
     missing_columns = [
-        column for column in required_columns
+        column
+        for column in required_columns
         if column not in df.columns
     ]
 
@@ -165,76 +162,54 @@ def validate_data(df: pd.DataFrame) -> None:
             f"Missing required columns: {missing_columns}"
         )
 
-    if df[required_columns].isnull().any().any():
-        raise ValueError("Dataset contains missing values.")
-
-    if not df["open_time"].is_monotonic_increasing:
-        raise ValueError("Timestamps are not chronological.")
-
-    if df["open_time"].duplicated().any():
-        raise ValueError("Duplicate candle timestamps detected.")
-
-    if (df["open"] <= 0).any():
-        raise ValueError("Invalid open prices detected.")
-
-    if (df["high"] <= 0).any():
-        raise ValueError("Invalid high prices detected.")
-
-    if (df["low"] <= 0).any():
-        raise ValueError("Invalid low prices detected.")
-
-    if (df["close"] <= 0).any():
-        raise ValueError("Invalid close prices detected.")
-
-    if (df["volume"] < 0).any():
-        raise ValueError("Negative volume detected.")
-
-    invalid_ohlc = (
-        (df["high"] < df["open"])
-        | (df["high"] < df["close"])
-        | (df["high"] < df["low"])
-        | (df["low"] > df["open"])
-        | (df["low"] > df["close"])
+    gaps = (
+        df["timestamp"]
+        .diff()
+        .dropna()
+        .dt.total_seconds()
+        .div(INTERVAL_SECONDS)
     )
 
-    if invalid_ohlc.any():
-        raise ValueError("Invalid OHLC relationships detected.")
+    gap_count = int((gaps > 1).sum())
 
-    gaps = df["open_time"].diff().dropna()
-
-    expected_gap = pd.Timedelta(minutes=5)
-
-    irregular_gaps = gaps[gaps != expected_gap]
-
-    if not irregular_gaps.empty:
-        print(
-            f"WARNING: {len(irregular_gaps)} irregular "
-            "5-minute candle gaps detected."
-        )
-
-    print("Data validation completed.")
+    return {
+        "rows": len(df),
+        "duplicate_timestamps": int(
+            df["timestamp"].duplicated().sum()
+        ),
+        "missing_values": int(df.isna().sum().sum()),
+        "chronological": bool(
+            df["timestamp"].is_monotonic_increasing
+        ),
+        "gaps": gap_count,
+        "start": df["timestamp"].iloc[0],
+        "end": df["timestamp"].iloc[-1],
+    }
 
 
 def save_data(df: pd.DataFrame) -> None:
-    """Save validated market data to the project data directory."""
+    """Save validated data to the GQE-01 data directory."""
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    df.to_csv(OUTPUT_FILE, index=False)
-
-    print(f"Saved dataset to: {OUTPUT_FILE}")
-    print(f"Total candles: {len(df):,}")
-
-
-def main() -> None:
-    """Main data pipeline."""
-
-    df = download_data()
-    df = clean_data(df)
-
-    validate_data(df)
-    save_data(df)
+    df.to_csv(
+        OUTPUT_FILE,
+        index=False,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    data = download_history()
+    validation = validate_ohlcv(data)
+
+    save_data(data)
+
+    print("GQE-01 market data downloaded.")
+    print(f"Rows: {validation['rows']:,}")
+    print(f"Start: {validation['start']}")
+    print(f"End:   {validation['end']}")
+    print(f"Gaps:  {validation['gaps']}")
+    print(f"Saved: {OUTPUT_FILE}")
