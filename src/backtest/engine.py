@@ -218,6 +218,8 @@ def run_backtest(df: pd.DataFrame) -> tuple[list[Trade], pd.DataFrame]:
                 daily_start_equity = cash
 
             daily_locked = False
+            consecutive_losses = 0
+            consecutive_loss_locked = False
 
         # Prevent a position from being closed and re-opened
         # on the same candle using the same previous-candle signal.
